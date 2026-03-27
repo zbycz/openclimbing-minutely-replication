@@ -3,33 +3,36 @@
  * OSM Climbing Dataset Updater
  *
  * Downloads replication diffs from planet.openstreetmap.org and applies them
- * to a filtered PBF dataset (climbing + dependency closure).
+ * to a filtered dataset in Overpass JSON format (climbing + dependency closure).
  * Missing referenced elements are fetched from the live OSM API using multi-get.
  *
- * Usage: bun run osm-update.ts input.pbf [output.pbf]
+ * Usage: bun run osm-update.ts input.json [output.json]
+ *
+ * Input JSON format (produced by pbf_to_overpass_json.py):
+ *   { "osm3s": { "timestamp_osm_base": "..." }, "elements": [...] }
  */
 
-import { execSync } from "child_process";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { gunzipSync } from "zlib";
-import { XMLParser } from "fast-xml-parser";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const PBF_FILE   = process.argv[2];
-const OUTPUT_PBF = process.argv[3] ?? PBF_FILE.replace(/\.pbf$/, ".updated.pbf");
-const STATE_FILE = PBF_FILE + ".state";
+if (!process.argv[2]) { console.error("Usage: bun run osm-update.ts input.json [output.json]"); process.exit(1); }
 
-const OSM_API   = "https://api.openstreetmap.org/api/0.6";
+const INPUT_FILE  = process.argv[2] as string;
+const OUTPUT_FILE = process.argv[3] ?? INPUT_FILE.replace(/\.json$/, ".updated.json");
+const STATE_FILE  = INPUT_FILE + ".state.json";
+
+const OSM_API = "https://api.openstreetmap.org/api/0.6";
 
 // Replication levels — day diffs are ~1 GB decompressed; we top out at hour
-const REPLICATIONS_MINUTE_URL      = "https://planet.openstreetmap.org/replication/minute";
-const REPLICATIONS_HOUR_URL        = "https://planet.openstreetmap.org/replication/hour";
+const REPLICATIONS_MINUTE_URL = "https://planet.openstreetmap.org/replication/minute";
+const REPLICATIONS_HOUR_URL   = "https://planet.openstreetmap.org/replication/hour";
 const MINUTE_THRESHOLD = 120; // use hour replication when > 2 h of diffs pending
 
-const MAX_API_REQUESTS = 100;  // abort dependency fetch after this many OSM API calls
+const MAX_API_REQUESTS  = 100;  // abort dependency fetch after this many OSM API calls
 const API_RATE_LIMIT_MS = 1200; // ≥ 1 s between calls (OSM API policy)
-const BATCH_SIZE = 100;         // element IDs per multi-get request
+const BATCH_SIZE        = 100;  // element IDs per multi-get request
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -60,14 +63,20 @@ interface OsmRelation {
 type OsmElement = OsmNode | OsmWay | OsmRelation;
 
 interface Dataset {
-  nodes: Map<number, OsmNode>;
-  ways:  Map<number, OsmWay>;
+  nodes:     Map<number, OsmNode>;
+  ways:      Map<number, OsmWay>;
   relations: Map<number, OsmRelation>;
 }
 
 interface ReplicationState {
   sequenceNumber: number;
   timestamp: string;
+}
+
+interface StateFile {
+  sequenceNumber_minute?: number;
+  sequenceNumber_hour?:   number;
+  timestamp?: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -110,20 +119,20 @@ async function fetchRetry(url: string, retries = 3): Promise<Response> {
   throw lastErr;
 }
 
-/** Escape characters that are special in XML attribute values */
-function escapeXml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
 // ─── Climbing filter ──────────────────────────────────────────────────────────
 
 /**
  * Returns true if the element is a "climbing" element that belongs
  * in this filtered dataset (regardless of whether it's already present).
+ *
+ *     osmium tags-filter \
+ *         planet-260316.osm.pbf \
+ *         'nwr/climbing*' \
+ *         nwr/sport=climbing \
+ *         nwr/sport=via_ferrata \
+ *         --overwrite \
+ *         --progress \
+ *         -o filtered.osm.pbf
  */
 function isClimbing(tags: Record<string, string>): boolean {
   if (!tags || Object.keys(tags).length === 0) return false;
@@ -132,82 +141,71 @@ function isClimbing(tags: Record<string, string>): boolean {
     tags["sport"] === "via_ferrata" ||
     tags["leisure"] === "climbing" ||
     "climbing" in tags ||
-    Object.keys(tags).some(k => k.startsWith("climbing:"))
+    Object.keys(tags).some(k => k.startsWith("climbing"))
   );
 }
 
-// ─── Shared XMLParser config ───────────────────────────────────────────────────
+// ─── JSON I/O ─────────────────────────────────────────────────────────────────
 
-const ARRAY_TAGS = new Set(["node", "way", "relation", "tag", "nd", "member", "create", "modify", "delete"]);
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@",
-  isArray: (name) => ARRAY_TAGS.has(name),
-  processEntities: false,   // OSM XML doesn't use XML entities; avoids the 1000-entity default cap
-});
+/** Load Overpass-format JSON into an in-memory Dataset. */
+function loadJson(path: string): { dataset: Dataset; timestamp: string } {
+  const raw = JSON.parse(readFileSync(path, "utf-8"));
+  const dataset: Dataset = { nodes: new Map(), ways: new Map(), relations: new Map() };
 
-// ─── Parsing helpers ───────────────────────────────────────────────────────────
+  for (const el of raw.elements ?? []) {
+    if (el.type === "node") {
+      dataset.nodes.set(el.id, {
+        type: "node",
+        id: el.id, version: el.version ?? 0, timestamp: el.timestamp ?? "",
+        uid: el.uid ?? 0, user: el.user ?? "", changeset: el.changeset ?? 0,
+        lat: el.lat, lon: el.lon, tags: el.tags ?? {},
+      });
+    } else if (el.type === "way") {
+      dataset.ways.set(el.id, {
+        type: "way",
+        id: el.id, version: el.version ?? 0, timestamp: el.timestamp ?? "",
+        uid: el.uid ?? 0, user: el.user ?? "", changeset: el.changeset ?? 0,
+        nodes: el.nodes ?? [], tags: el.tags ?? {},
+      });
+    } else if (el.type === "relation") {
+      dataset.relations.set(el.id, {
+        type: "relation",
+        id: el.id, version: el.version ?? 0, timestamp: el.timestamp ?? "",
+        uid: el.uid ?? 0, user: el.user ?? "", changeset: el.changeset ?? 0,
+        members: (el.members ?? []).map((m: any) => ({
+          type: m.type as "node" | "way" | "relation",
+          ref: m.ref, role: m.role ?? "",
+        })),
+        tags: el.tags ?? {},
+      });
+    }
+  }
 
-function parseTags(tagArr: any[]): Record<string, string> {
-  const tags: Record<string, string> = {};
-  for (const t of tagArr ?? []) tags[t["@k"]] = t["@v"];
-  return tags;
+  return { dataset, timestamp: raw.osm3s?.timestamp_osm_base ?? "" };
 }
 
-function parseNode(n: any): OsmNode {
-  return {
-    type: "node",
-    id: +n["@id"], version: +n["@version"], timestamp: n["@timestamp"],
-    uid: +(n["@uid"] ?? 0), user: n["@user"] ?? "", changeset: +(n["@changeset"] ?? 0),
-    lat: +n["@lat"], lon: +n["@lon"],
-    tags: parseTags(n.tag),
-  };
-}
+/** Serialize Dataset back to Overpass-format JSON and write to disk. */
+function saveJson(path: string, dataset: Dataset, timestamp: string): void {
+  const elements: any[] = [];
 
-function parseWay(w: any): OsmWay {
-  return {
-    type: "way",
-    id: +w["@id"], version: +w["@version"], timestamp: w["@timestamp"],
-    uid: +(w["@uid"] ?? 0), user: w["@user"] ?? "", changeset: +(w["@changeset"] ?? 0),
-    nodes: (w.nd ?? []).map((nd: any) => +nd["@ref"]),
-    tags: parseTags(w.tag),
-  };
-}
+  for (const n of [...dataset.nodes.values()].sort((a, b) => a.id - b.id)) {
+    const el: any = { type: "node", id: n.id, lat: n.lat, lon: n.lon };
+    if (Object.keys(n.tags).length > 0) el.tags = n.tags;
+    elements.push(el);
+  }
+  for (const w of [...dataset.ways.values()].sort((a, b) => a.id - b.id)) {
+    const el: any = { type: "way", id: w.id, nodes: w.nodes };
+    if (Object.keys(w.tags).length > 0) el.tags = w.tags;
+    elements.push(el);
+  }
+  for (const r of [...dataset.relations.values()].sort((a, b) => a.id - b.id)) {
+    const el: any = { type: "relation", id: r.id, members: r.members };
+    if (Object.keys(r.tags).length > 0) el.tags = r.tags;
+    elements.push(el);
+  }
 
-function parseRelation(r: any): OsmRelation {
-  return {
-    type: "relation",
-    id: +r["@id"], version: +r["@version"], timestamp: r["@timestamp"],
-    uid: +(r["@uid"] ?? 0), user: r["@user"] ?? "", changeset: +(r["@changeset"] ?? 0),
-    members: (r.member ?? []).map((m: any) => ({
-      type: m["@type"] as "node" | "way" | "relation",
-      ref: +m["@ref"],
-      role: m["@role"] ?? "",
-    })),
-    tags: parseTags(r.tag),
-  };
-}
-
-function parseElements(section: any): OsmElement[] {
-  const out: OsmElement[] = [];
-  for (const n of section.node     ?? []) out.push(parseNode(n));
-  for (const w of section.way      ?? []) out.push(parseWay(w));
-  for (const r of section.relation ?? []) out.push(parseRelation(r));
-  return out;
-}
-
-// ─── PBF / OSM XML reading ────────────────────────────────────────────────────
-
-function parseOsmXml(xml: string): Dataset {
-  const parsed = xmlParser.parse(xml);
-  const osm = parsed.osm ?? {};
-  const dataset: Dataset = {
-    nodes: new Map(), ways: new Map(), relations: new Map(),
-  };
-  for (const n of osm.node     ?? []) { const el = parseNode(n);     dataset.nodes.set(el.id, el); }
-  for (const w of osm.way      ?? []) { const el = parseWay(w);      dataset.ways.set(el.id, el); }
-  for (const r of osm.relation ?? []) { const el = parseRelation(r); dataset.relations.set(el.id, el); }
-  return dataset;
+  const out = { osm3s: { timestamp_osm_base: timestamp }, elements };
+  writeFileSync(path, JSON.stringify(out, null, 2), "utf-8");
 }
 
 // ─── OSC diff: streaming SAX application ─────────────────────────────────────
@@ -247,35 +245,36 @@ function applyOscBuffer(buf: Buffer, dataset: Dataset): void {
     if (name === "node") {
       curNode = {
         type: "node",
-        id: +a.id, version: +a.version, timestamp: a.timestamp,
-        uid: +(a.uid ?? 0), user: a.user ?? "", changeset: +(a.changeset ?? 0),
+        id: +(a["id"] ?? 0), version: +(a["version"] ?? 0), timestamp: a["timestamp"] ?? "",
+        uid: +(a["uid"] ?? 0), user: a["user"] ?? "", changeset: +(a["changeset"] ?? 0),
         lat: numAttr(a, "lat"), lon: numAttr(a, "lon"),
         tags: {},
       };
     } else if (name === "way") {
       curWay = {
         type: "way",
-        id: +a.id, version: +a.version, timestamp: a.timestamp,
-        uid: +(a.uid ?? 0), user: a.user ?? "", changeset: +(a.changeset ?? 0),
+        id: +(a["id"] ?? 0), version: +(a["version"] ?? 0), timestamp: a["timestamp"] ?? "",
+        uid: +(a["uid"] ?? 0), user: a["user"] ?? "", changeset: +(a["changeset"] ?? 0),
         nodes: [], tags: {},
       };
     } else if (name === "relation") {
       curRelation = {
         type: "relation",
-        id: +a.id, version: +a.version, timestamp: a.timestamp,
-        uid: +(a.uid ?? 0), user: a.user ?? "", changeset: +(a.changeset ?? 0),
+        id: +(a["id"] ?? 0), version: +(a["version"] ?? 0), timestamp: a["timestamp"] ?? "",
+        uid: +(a["uid"] ?? 0), user: a["user"] ?? "", changeset: +(a["changeset"] ?? 0),
         members: [], tags: {},
       };
     } else if (name === "tag") {
       const el = curNode ?? curWay ?? curRelation;
-      if (el?.tags) el.tags[a.k] = a.v;
+      const k = a["k"], v = a["v"];
+      if (el?.tags && k != null && v != null) el.tags[k] = v;
     } else if (name === "nd" && curWay?.nodes) {
-      curWay.nodes.push(+a.ref);
+      curWay.nodes.push(+(a["ref"] ?? 0));
     } else if (name === "member" && curRelation?.members) {
       curRelation.members.push({
-        type: a.type as "node" | "way" | "relation",
-        ref: +a.ref,
-        role: a.role ?? "",
+        type: (a["type"] ?? "node") as "node" | "way" | "relation",
+        ref: +(a["ref"] ?? 0),
+        role: a["role"] ?? "",
       });
     }
   };
@@ -456,85 +455,27 @@ async function findSequenceForTimestamp(
   return lo;
 }
 
-// ─── OSM XML writer ───────────────────────────────────────────────────────────
-
-function writeOsmXml(dataset: Dataset, replicationTs: string): string {
-  const lines: string[] = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    `<osm version="0.6" generator="osm-climbing-updater">`,
-    `  <bounds minlat="-90" minlon="-180" maxlat="90" maxlon="180"/>`,
-  ];
-
-  const nodeAttrs = (n: OsmNode) =>
-    `id="${n.id}" version="${n.version}" timestamp="${n.timestamp}" uid="${n.uid}" ` +
-    `user="${escapeXml(n.user)}" changeset="${n.changeset}" lat="${n.lat}" lon="${n.lon}"`;
-
-  const baseAttrs = (el: OsmWay | OsmRelation) =>
-    `id="${el.id}" version="${el.version}" timestamp="${el.timestamp}" uid="${el.uid}" ` +
-    `user="${escapeXml(el.user)}" changeset="${el.changeset}"`;
-
-  const tagLines = (tags: Record<string, string>, indent: string) =>
-    Object.entries(tags).map(([k, v]) =>
-      `${indent}<tag k="${escapeXml(k)}" v="${escapeXml(v)}"/>`);
-
-  for (const n of [...dataset.nodes.values()].filter(n => Number.isFinite(n.id)).sort((a, b) => a.id - b.id)) {
-    const tags = tagLines(n.tags, "    ");
-    if (tags.length === 0) {
-      lines.push(`  <node ${nodeAttrs(n)}/>`);
-    } else {
-      lines.push(`  <node ${nodeAttrs(n)}>`);
-      lines.push(...tags);
-      lines.push(`  </node>`);
-    }
-  }
-
-  for (const w of [...dataset.ways.values()].filter(w => Number.isFinite(w.id)).sort((a, b) => a.id - b.id)) {
-    lines.push(`  <way ${baseAttrs(w)}>`);
-    for (const ref of w.nodes) lines.push(`    <nd ref="${ref}"/>`);
-    lines.push(...tagLines(w.tags, "    "));
-    lines.push(`  </way>`);
-  }
-
-  for (const r of [...dataset.relations.values()].filter(r => Number.isFinite(r.id)).sort((a, b) => a.id - b.id)) {
-    lines.push(`  <relation ${baseAttrs(r)}>`);
-    for (const m of r.members)
-      lines.push(`    <member type="${m.type}" ref="${m.ref}" role="${escapeXml(m.role)}"/>`);
-    lines.push(...tagLines(r.tags, "    "));
-    lines.push(`  </relation>`);
-  }
-
-  lines.push("</osm>");
-  return lines.join("\n");
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log("╔══════════════════════════════════════════╗");
   console.log("║  OSM Climbing Dataset Updater             ║");
   console.log("╚══════════════════════════════════════════╝\n");
-  console.log(`Input:  ${PBF_FILE}`);
-  console.log(`Output: ${OUTPUT_PBF}`);
+  console.log(`Input:  ${INPUT_FILE}`);
+  console.log(`Output: ${OUTPUT_FILE}`);
   console.log(`State:  ${STATE_FILE}\n`);
 
-  // ── Step 1: Read current PBF ─────────────────────────────────────────────────
-  console.log("── Step 1: Reading PBF ──────────────────────────────────────────");
-  const tempOsm = "/tmp/osm-updater-current.osm";
-  execSync(`osmium cat "${PBF_FILE}" -o "${tempOsm}" --overwrite`, { stdio: "pipe" });
-  const dataset = parseOsmXml(readFileSync(tempOsm, "utf-8"));
+  // ── Step 1: Read current JSON ────────────────────────────────────────────────
+  console.log("── Step 1: Reading JSON ─────────────────────────────────────────");
+  const { dataset, timestamp: inputTs } = loadJson(INPUT_FILE);
+  if (!inputTs) throw new Error("Could not read timestamp_osm_base from input JSON (osm3s field)");
   console.log(`  Loaded: ${dataset.nodes.size} nodes, ${dataset.ways.size} ways, ${dataset.relations.size} relations`);
+  console.log(`  Timestamp: ${inputTs}`);
 
   // ── Step 2: Choose replication level and find sequences ──────────────────────
   console.log("\n── Step 2: Replication state ────────────────────────────────────");
 
-  // Extract PBF timestamp
-  const pbfInfo = execSync(`osmium fileinfo "${PBF_FILE}"`, { encoding: "utf-8" });
-  const tsMatch = pbfInfo.match(/osmosis_replication_timestamp=(\S+)/);
-  const pbfTs   = tsMatch ? tsMatch[1] : "";
-  if (!pbfTs) throw new Error("Could not read osmosis_replication_timestamp from PBF header");
-
-  // Choose granularity based on how stale the data is
-  const ageMins = (Date.now() - new Date(pbfTs).getTime()) / 60_000;
+  const ageMins = (Date.now() - new Date(inputTs).getTime()) / 60_000;
   let replicationUrl: string;
   let levelName: string;
   let lookback: number;
@@ -545,29 +486,27 @@ async function main() {
     replicationUrl = REPLICATIONS_HOUR_URL;   levelName = "hour";   lookback = 8_760;
   }
 
-  // Fetch current remote state for the chosen level
   const remoteState = parseState(await (await fetchRetry(`${replicationUrl}/state.txt`)).text());
   console.log(`  Remote ${levelName}: seq=${remoteState.sequenceNumber}  ts=${remoteState.timestamp}`);
-  console.log(`  PBF age: ${Math.round(ageMins)} min → using ${levelName} replication`);
+  console.log(`  Data age: ${Math.round(ageMins)} min → using ${levelName} replication`);
 
-  // Load or discover local state
+  // Load or discover local sequence number
+  const stateKey = `sequenceNumber_${levelName}` as "sequenceNumber_minute" | "sequenceNumber_hour";
   let localSeq: number;
-  const stateKey = `sequenceNumber_${levelName}=`;
 
   if (existsSync(STATE_FILE)) {
-    const txt  = readFileSync(STATE_FILE, "utf-8");
-    const line = txt.split("\n").find(l => l.startsWith(stateKey));
-    if (line) {
-      localSeq = parseInt(line.slice(stateKey.length));
+    const saved = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as StateFile;
+    if (saved[stateKey] != null) {
+      localSeq = saved[stateKey] as number;
       console.log(`  Local ${levelName}: seq=${localSeq}`);
     } else {
       console.log(`  No ${levelName} state found – searching replication archive…`);
-      localSeq = await findSequenceForTimestamp(replicationUrl, pbfTs, remoteState.sequenceNumber, lookback);
+      localSeq = await findSequenceForTimestamp(replicationUrl, inputTs, remoteState.sequenceNumber, lookback);
       console.log(`  Found starting seq: ${localSeq}`);
     }
   } else {
-    console.log(`  No state file – searching ${levelName} replication archive for ${pbfTs}…`);
-    localSeq = await findSequenceForTimestamp(replicationUrl, pbfTs, remoteState.sequenceNumber, lookback);
+    console.log(`  No state file – searching ${levelName} replication archive for ${inputTs}…`);
+    localSeq = await findSequenceForTimestamp(replicationUrl, inputTs, remoteState.sequenceNumber, lookback);
     console.log(`  Found starting seq: ${localSeq}`);
   }
 
@@ -585,11 +524,11 @@ async function main() {
   for (let seq = localSeq + 1; seq <= remoteState.sequenceNumber; seq++) {
     const url = `${replicationUrl}/${seqToPath(seq)}.osc.gz`;
     try {
-      const res    = await fetchRetry(url);
-      const buf    = await res.arrayBuffer();
-      const xml    = gunzipSync(Buffer.from(buf));
+      const res   = await fetchRetry(url);
+      const buf   = await res.arrayBuffer();
+      const xml   = gunzipSync(Buffer.from(buf));
       applyOscBuffer(xml, dataset);
-      lastApplied  = seq;
+      lastApplied = seq;
     } catch (e: any) {
       console.warn(`  ⚠ Skipping seq ${seq}: ${e?.message ?? e}`);
       continue;
@@ -603,7 +542,7 @@ async function main() {
   }
   console.log(`  Applied through seq ${lastApplied}`);
 
-  // ── Step 4: Fetch missing dependencies from OSM API ───────────────────────────
+  // ── Step 4: Fetch missing dependencies from OSM API ──────────────────────────
   console.log("\n── Step 4: Fetching missing dependencies ────────────────────────");
   const limiter = new RateLimiter(API_RATE_LIMIT_MS, MAX_API_REQUESTS);
 
@@ -642,27 +581,17 @@ async function main() {
 
   // ── Step 5: Write output ──────────────────────────────────────────────────────
   console.log("\n── Step 5: Writing output ───────────────────────────────────────");
-  const tempOut = "/tmp/osm-updater-output.osm";
-  const xml     = writeOsmXml(dataset, remoteState.timestamp);
-  writeFileSync(tempOut, xml, "utf-8");
+  saveJson(OUTPUT_FILE, dataset, remoteState.timestamp);
 
-  execSync(
-    `osmium sort "${tempOut}" -o "${OUTPUT_PBF}" --overwrite ` +
-    `--output-header="osmosis_replication_sequence_number=${lastApplied}" ` +
-    `--output-header="osmosis_replication_timestamp=${remoteState.timestamp}" ` +
-    `--output-header="generator=osm-climbing-updater"`,
-    { stdio: "pipe" },
-  );
+  // Update state file (preserves both minute and hour sequences)
+  const prevState: StateFile = existsSync(STATE_FILE)
+    ? JSON.parse(readFileSync(STATE_FILE, "utf-8"))
+    : {};
+  prevState[stateKey] = lastApplied;
+  prevState.timestamp = remoteState.timestamp;
+  writeFileSync(STATE_FILE, JSON.stringify(prevState, null, 2), "utf-8");
 
-  // Update state file (preserves other level sequences)
-  const prevState = existsSync(STATE_FILE) ? readFileSync(STATE_FILE, "utf-8") : "";
-  const updateLine = (text: string, key: string, value: string) => {
-    const lines = text.split("\n").filter(l => l && !l.startsWith(key) && !l.startsWith("#") && !l.startsWith("timestamp="));
-    return [`#osm-climbing-updater`, `timestamp=${remoteState.timestamp}`, ...lines, `${key}${value}`].join("\n") + "\n";
-  };
-  writeFileSync(STATE_FILE, updateLine(prevState, `sequenceNumber_${levelName}=`, String(lastApplied)));
-
-  console.log(`  Written: ${OUTPUT_PBF}`);
+  console.log(`  Written: ${OUTPUT_FILE}`);
   console.log(`  State:   ${STATE_FILE}`);
   console.log(`\n✓ Done — ${dataset.nodes.size} nodes, ${dataset.ways.size} ways, ${dataset.relations.size} relations`);
   console.log(`  API requests used: ${limiter.count}/${MAX_API_REQUESTS}`);
