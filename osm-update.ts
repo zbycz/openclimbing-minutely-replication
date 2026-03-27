@@ -6,7 +6,7 @@
  * to a filtered PBF dataset (climbing + dependency closure).
  * Missing referenced elements are fetched from the live OSM API using multi-get.
  *
- * Usage: bun run osm-update.ts [input.pbf] [output.pbf]
+ * Usage: bun run osm-update.ts input.pbf [output.pbf]
  */
 
 import { execSync } from "child_process";
@@ -16,15 +16,15 @@ import { XMLParser } from "fast-xml-parser";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const PBF_FILE   = process.argv[2] ?? "/workspace/filtered.osm.pbf";
+const PBF_FILE   = process.argv[2];
 const OUTPUT_PBF = process.argv[3] ?? PBF_FILE.replace(/\.pbf$/, ".updated.pbf");
 const STATE_FILE = PBF_FILE + ".state";
 
 const OSM_API   = "https://api.openstreetmap.org/api/0.6";
 
 // Replication levels — day diffs are ~1 GB decompressed; we top out at hour
-const MINUTE_REPL      = "https://planet.openstreetmap.org/replication/minute";
-const HOUR_REPL        = "https://planet.openstreetmap.org/replication/hour";
+const REPLICATIONS_MINUTE_URL      = "https://planet.openstreetmap.org/replication/minute";
+const REPLICATIONS_HOUR_URL        = "https://planet.openstreetmap.org/replication/hour";
 const MINUTE_THRESHOLD = 120; // use hour replication when > 2 h of diffs pending
 
 const MAX_API_REQUESTS = 100;  // abort dependency fetch after this many OSM API calls
@@ -535,18 +535,18 @@ async function main() {
 
   // Choose granularity based on how stale the data is
   const ageMins = (Date.now() - new Date(pbfTs).getTime()) / 60_000;
-  let replBase: string;
+  let replicationUrl: string;
   let levelName: string;
   let lookback: number;
 
   if (ageMins <= MINUTE_THRESHOLD) {
-    replBase = MINUTE_REPL; levelName = "minute"; lookback = 43_200;
+    replicationUrl = REPLICATIONS_MINUTE_URL; levelName = "minute"; lookback = 43_200;
   } else {
-    replBase = HOUR_REPL;   levelName = "hour";   lookback = 8_760;
+    replicationUrl = REPLICATIONS_HOUR_URL;   levelName = "hour";   lookback = 8_760;
   }
 
   // Fetch current remote state for the chosen level
-  const remoteState = parseState(await (await fetchRetry(`${replBase}/state.txt`)).text());
+  const remoteState = parseState(await (await fetchRetry(`${replicationUrl}/state.txt`)).text());
   console.log(`  Remote ${levelName}: seq=${remoteState.sequenceNumber}  ts=${remoteState.timestamp}`);
   console.log(`  PBF age: ${Math.round(ageMins)} min → using ${levelName} replication`);
 
@@ -562,12 +562,12 @@ async function main() {
       console.log(`  Local ${levelName}: seq=${localSeq}`);
     } else {
       console.log(`  No ${levelName} state found – searching replication archive…`);
-      localSeq = await findSequenceForTimestamp(replBase, pbfTs, remoteState.sequenceNumber, lookback);
+      localSeq = await findSequenceForTimestamp(replicationUrl, pbfTs, remoteState.sequenceNumber, lookback);
       console.log(`  Found starting seq: ${localSeq}`);
     }
   } else {
     console.log(`  No state file – searching ${levelName} replication archive for ${pbfTs}…`);
-    localSeq = await findSequenceForTimestamp(replBase, pbfTs, remoteState.sequenceNumber, lookback);
+    localSeq = await findSequenceForTimestamp(replicationUrl, pbfTs, remoteState.sequenceNumber, lookback);
     console.log(`  Found starting seq: ${localSeq}`);
   }
 
@@ -583,7 +583,7 @@ async function main() {
   let lastApplied = localSeq;
 
   for (let seq = localSeq + 1; seq <= remoteState.sequenceNumber; seq++) {
-    const url = `${replBase}/${seqToPath(seq)}.osc.gz`;
+    const url = `${replicationUrl}/${seqToPath(seq)}.osc.gz`;
     try {
       const res    = await fetchRetry(url);
       const buf    = await res.arrayBuffer();
