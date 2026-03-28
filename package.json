@@ -1,11 +1,16 @@
 {
-  "name": "osmupdater2",
-  "version": "1.0.0",
+  "name": "osm-updater",
+  "module": "index.ts",
   "type": "module",
-  "scripts": {
-    "update": "bun osm-update.ts"
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/sax": "^1.2.7"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
   },
   "dependencies": {
-    "fast-xml-parser": "^4.5.3"
+    "sax": "^1.6.0"
   }
 }
