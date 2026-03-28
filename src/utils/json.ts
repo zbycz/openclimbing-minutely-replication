@@ -59,5 +59,5 @@ export function saveJson(path: string, dataset: Dataset, timestamp: string): voi
     }
 
     const out = {osm3s: {timestamp_osm_base: timestamp}, elements};
-    writeFileSync(path, JSON.stringify(out, null, 2), "utf-8");
+    writeFileSync(path, JSON.stringify(out), "utf-8");
 }
