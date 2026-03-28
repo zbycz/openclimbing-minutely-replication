@@ -1,3 +1,6 @@
+*.pbf
+*.json
+
 # dependencies (bun install)
 node_modules
 

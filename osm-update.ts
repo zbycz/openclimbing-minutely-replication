@@ -459,7 +459,7 @@ async function findSequenceForTimestamp(
 
 async function main() {
   console.log("╔══════════════════════════════════════════╗");
-  console.log("║  OSM Climbing Dataset Updater             ║");
+  console.log("║  OSM Climbing Dataset Updater            ║");
   console.log("╚══════════════════════════════════════════╝\n");
   console.log(`Input:  ${INPUT_FILE}`);
   console.log(`Output: ${OUTPUT_FILE}`);
