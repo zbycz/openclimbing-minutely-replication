@@ -14,7 +14,7 @@
 
 import {existsSync, readFileSync, writeFileSync} from "fs";
 import {gunzipSync} from "zlib";
-import type {OsmNode, OsmRelation, OsmWay, StateFile, StateKey} from "./utils/types.ts";
+import type {OsmNode, OsmRelation, OsmWay, ReplicationState, StateFile, StateKey} from "./utils/types.ts";
 import {fetchRetry, parseState, seqToPath} from "./utils/helpers.ts";
 import {loadJson, saveJson} from "./utils/json.ts";
 import {applyOscBuffer} from "./utils/apply-osc-buffer.ts";
@@ -42,6 +42,15 @@ const limiter = new RateLimiter(API_RATE_LIMIT_MS, MAX_API_REQUESTS);
 
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
+
+const updateStateFile = (stateKey: "sequenceNumber_minute" | "sequenceNumber_hour", lastApplied: number, remoteState: ReplicationState) => {
+  const prevState: StateFile = existsSync(STATE_FILE)
+      ? JSON.parse(readFileSync(STATE_FILE, "utf-8"))
+      : {};
+  prevState[stateKey] = lastApplied;
+  prevState.timestamp = remoteState.timestamp;
+  writeFileSync(STATE_FILE, JSON.stringify(prevState, null, 2), "utf-8");
+}
 
 async function main() {
   console.log("╔══════════════════════════════════════════╗");
@@ -98,13 +107,14 @@ async function main() {
 
   const pending = remoteState.sequenceNumber - localSeq;
   if (pending <= 0) {
-    console.log("\n  ✓ Already up to date.");
-    return;
+    console.log("\n  ✓ Already up to date, returning error code to break the script.");
+    process.exit(1);
   }
   console.log(`  Applying ${pending} diff(s): seq ${localSeq + 1} → ${remoteState.sequenceNumber}`);
 
   // ── Step 3: Download and apply diffs ─────────────────────────────────────────
   console.log("\n── Step 3: Applying replication diffs ───────────────────────────");
+  let changesMade = 0;
   let lastApplied = localSeq;
 
   for (let seq = localSeq + 1; seq <= remoteState.sequenceNumber; seq++) {
@@ -113,7 +123,7 @@ async function main() {
       const res   = await fetchRetry(url);
       const buf   = await res.arrayBuffer();
       const xml   = gunzipSync(Buffer.from(buf));
-      applyOscBuffer(xml, dataset);
+      changesMade += applyOscBuffer(xml, dataset);
       lastApplied = seq;
     } catch (e: any) {
       console.warn(`  ⚠ Skipping seq ${seq}: ${e?.message ?? e}`);
@@ -127,6 +137,12 @@ async function main() {
     }
   }
   console.log(`  Applied through seq ${lastApplied}`);
+  console.log(`  Changes made: ${changesMade}`);
+  if (changesMade === 0) {
+    console.log("\n  ✓ No changes to climbing-related elements, returning error code to break the script.");
+    updateStateFile(stateKey, lastApplied, remoteState);
+    process.exit(1);
+  }
 
   // ── Step 4: Fetch missing dependencies from OSM API ──────────────────────────
   console.log("\n── Step 4: Fetching missing dependencies ────────────────────────");
@@ -168,13 +184,7 @@ async function main() {
   console.log("\n── Step 5: Writing output ───────────────────────────────────────");
   saveJson(OUTPUT_FILE, dataset, remoteState.timestamp);
 
-  // Update state file (preserves both minute and hour sequences)
-  const prevState: StateFile = existsSync(STATE_FILE)
-      ? JSON.parse(readFileSync(STATE_FILE, "utf-8"))
-      : {};
-  prevState[stateKey] = lastApplied;
-  prevState.timestamp = remoteState.timestamp;
-  writeFileSync(STATE_FILE, JSON.stringify(prevState, null, 2), "utf-8");
+  updateStateFile(stateKey, lastApplied, remoteState);
 
   console.log(`  Written: ${OUTPUT_FILE}`);
   console.log(`  State:   ${STATE_FILE}`);

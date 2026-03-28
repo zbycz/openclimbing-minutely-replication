@@ -10,7 +10,38 @@ import {isClimbing} from "./filter.ts";
  * Parse a decompressed OSC XML buffer with a streaming SAX parser and apply
  * each change directly to `dataset`.  Peak extra memory ≈ size of one element.
  */
-export function applyOscBuffer(buf: Buffer, dataset: Dataset): void {
+export function applyOscBuffer(buf: Buffer, dataset: Dataset): number {
+    let changesMade = 0;
+    const commit = (el: OsmNode | OsmWay | OsmRelation) => {
+        if (action === "delete") {
+            if (el.type === "node" && dataset.nodes.has(el.id)) {
+                dataset.nodes.delete(el.id);
+                changesMade += 1;
+            }
+            else if (el.type === "way" && dataset.ways.has(el.id)) {
+                dataset.ways.delete(el.id);
+                changesMade += 1;
+            }
+            else if (el.type === "relation" && dataset.relations.has(el.id)) {
+                dataset.relations.delete(el.id);
+                changesMade += 1;
+            }
+            return;
+        }
+        // create / modify: keep if already in dataset OR newly climbing
+        const inDataset =
+            (el.type === "node" && dataset.nodes.has(el.id)) ||
+            (el.type === "way" && dataset.ways.has(el.id)) ||
+            (el.type === "relation" && dataset.relations.has(el.id));
+
+        if (inDataset || isClimbing(el.tags)) {
+            changesMade += 1;
+            if (el.type === "node") dataset.nodes.set(el.id, el as OsmNode);
+            else if (el.type === "way") dataset.ways.set(el.id, el as OsmWay);
+            else if (el.type === "relation") dataset.relations.set(el.id, el as OsmRelation);
+        }
+    };
+
     const parser = sax.parser(true /* strict */);
 
     // Current action context: "create" | "modify" | "delete"
@@ -77,26 +108,6 @@ export function applyOscBuffer(buf: Buffer, dataset: Dataset): void {
             return;
         }
 
-        const commit = (el: OsmNode | OsmWay | OsmRelation) => {
-            if (action === "delete") {
-                if (el.type === "node") dataset.nodes.delete(el.id);
-                else if (el.type === "way") dataset.ways.delete(el.id);
-                else if (el.type === "relation") dataset.relations.delete(el.id);
-                return;
-            }
-            // create / modify: keep if already in dataset OR newly climbing
-            const inDataset =
-                (el.type === "node" && dataset.nodes.has(el.id)) ||
-                (el.type === "way" && dataset.ways.has(el.id)) ||
-                (el.type === "relation" && dataset.relations.has(el.id));
-
-            if (inDataset || isClimbing(el.tags)) {
-                if (el.type === "node") dataset.nodes.set(el.id, el as OsmNode);
-                else if (el.type === "way") dataset.ways.set(el.id, el as OsmWay);
-                else if (el.type === "relation") dataset.relations.set(el.id, el as OsmRelation);
-            }
-        };
-
         if (name === "node" && curNode) {
             commit(curNode as OsmNode);
             curNode = null;
@@ -120,4 +131,6 @@ export function applyOscBuffer(buf: Buffer, dataset: Dataset): void {
     for (let off = 0; off < buf.length; off += CHUNK)
         parser.write(buf.subarray(off, off + CHUNK).toString("utf-8"));
     parser.close();
+
+    return changesMade;
 }
