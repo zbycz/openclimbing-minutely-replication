@@ -41,3 +41,5 @@ export interface StateFile {
     sequenceNumber_hour?:   number;
     timestamp?: string;
 }
+
+export type StateKey = "sequenceNumber_minute" | "sequenceNumber_hour";

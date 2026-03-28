@@ -14,7 +14,7 @@
 
 import {existsSync, readFileSync, writeFileSync} from "fs";
 import {gunzipSync} from "zlib";
-import type {OsmNode, OsmRelation, OsmWay, StateFile} from "./utils/types.ts";
+import type {OsmNode, OsmRelation, OsmWay, StateFile, StateKey} from "./utils/types.ts";
 import {fetchRetry, parseState, seqToPath} from "./utils/helpers.ts";
 import {loadJson, saveJson} from "./utils/json.ts";
 import {applyOscBuffer} from "./utils/apply-osc-buffer.ts";
@@ -77,7 +77,7 @@ async function main() {
   console.log(`  Data age: ${Math.round(ageMins)} min → using ${levelName} replication`);
 
   // Load or discover local sequence number
-  const stateKey = `sequenceNumber_${levelName}` as "sequenceNumber_minute" | "sequenceNumber_hour";
+  const stateKey = `sequenceNumber_${levelName}` as StateKey;
   let localSeq: number;
 
   if (existsSync(STATE_FILE)) {
