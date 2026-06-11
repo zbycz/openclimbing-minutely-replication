@@ -15,7 +15,7 @@ Runs under `nodeuser`.
 
 First prepare initial data by processing the planet.pbf (it could work with overpass seed, but didn't try).
 
-see openclimbing-osmimum project TODO
+- see https://github.com/zbycz/openclimbing-osmium-import
 
 Then run:
 ```bash
