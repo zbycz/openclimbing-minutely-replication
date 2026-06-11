@@ -11,8 +11,3 @@ echo "END $(date)"
 echo "-----------------------------------------------"
 
 # flock -n -- doesn't wait, just exits when already running. Important for cron. Risk: neverending updater, but hopeful it is fine.
-
-#CRON:
-# * *     * * *   nodeuser        bash /home/nodeuser/updater.sh >>/home/nodeuser/updater.log 2>&1
-# 0 4     * * *   nodeuser        rm /home/nodeuser/updater.log
-
