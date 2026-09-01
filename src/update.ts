@@ -43,11 +43,13 @@ const limiter = new RateLimiter(API_RATE_LIMIT_MS, MAX_API_REQUESTS);
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-const updateStateFile = (stateKey: "sequenceNumber_minute" | "sequenceNumber_hour", lastApplied: number, remoteState: ReplicationState) => {
+const updateStateFile = (stateKey: StateKey, lastApplied: number, remoteState: ReplicationState) => {
+  const otherKey: StateKey = stateKey === "sequenceNumber_minute" ? "sequenceNumber_hour" : "sequenceNumber_minute";
   const prevState: StateFile = existsSync(STATE_FILE)
       ? JSON.parse(readFileSync(STATE_FILE, "utf-8"))
       : {};
   prevState[stateKey] = lastApplied;
+  delete prevState[otherKey];
   prevState.timestamp = remoteState.timestamp;
   writeFileSync(STATE_FILE, JSON.stringify(prevState, null, 2), "utf-8");
 }
