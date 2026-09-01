@@ -1,5 +1,6 @@
 import type {Dataset, OsmNode, OsmRelation, OsmWay} from "./types.ts";
 import sax from "sax";
+import {StringDecoder} from "string_decoder";
 import {isClimbing} from "./filter.ts";
 
 // ─── OSC diff: streaming SAX application ─────────────────────────────────────
@@ -126,10 +127,14 @@ export function applyOscBuffer(buf: Buffer, dataset: Dataset): number {
         throw e;
     };
 
-    // Feed in chunks to avoid one giant string allocation
+    // Feed in chunks to avoid one giant string allocation. StringDecoder holds
+    // back a multi-byte character split across a chunk boundary - a plain
+    // toString() would turn it into U+FFFD and silently corrupt the tag value.
     const CHUNK = 256 * 1024;
+    const decoder = new StringDecoder("utf-8");
     for (let off = 0; off < buf.length; off += CHUNK)
-        parser.write(buf.subarray(off, off + CHUNK).toString("utf-8"));
+        parser.write(decoder.write(buf.subarray(off, off + CHUNK)));
+    parser.write(decoder.end());
     parser.close();
 
     return changesMade;
