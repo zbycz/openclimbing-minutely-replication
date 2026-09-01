@@ -133,8 +133,8 @@ async function main() {
       changesMade += applyOscBuffer(xml, dataset);
       lastApplied = seq;
     } catch (e: any) {
-      console.warn(`  ⚠ Skipping seq ${seq}: ${e?.message ?? e}`);
-      continue;
+      console.warn(`  ⚠ Stopping at seq ${seq}: ${e?.message ?? e}`);
+      break;
     }
 
     const step = Math.max(1, Math.floor(pending / 20));
@@ -145,9 +145,21 @@ async function main() {
   }
   console.log(`  Applied through seq ${lastApplied}`);
   console.log(`  Changes made: ${changesMade}`);
+
+  if (lastApplied === localSeq) {
+    console.log("\n  ✗ No diff applied, returning error code to break the script.");
+    process.exit(1);
+  }
+
+  // lastApplied may lag the remote head when a diff failed - the state must then
+  // record that sequence's own timestamp, otherwise the gap is never retried
+  const appliedState: ReplicationState = lastApplied === remoteState.sequenceNumber
+      ? remoteState
+      : parseState(await (await fetchRetry(`${replicationUrl}/${seqToPath(lastApplied)}.state.txt`)).text());
+
   if (changesMade === 0) {
     console.log("\n  ✓ No changes to climbing-related elements, returning error code to break the script.");
-    updateStateFile(stateKey, lastApplied, remoteState);
+    updateStateFile(stateKey, lastApplied, appliedState);
     process.exit(1);
   }
 
@@ -189,9 +201,9 @@ async function main() {
 
   // ── Step 5: Write output ──────────────────────────────────────────────────────
   console.log("\n── Step 5: Writing output ───────────────────────────────────────");
-  saveJson(OUTPUT_FILE, dataset, remoteState.timestamp);
+  saveJson(OUTPUT_FILE, dataset, appliedState.timestamp);
 
-  updateStateFile(stateKey, lastApplied, remoteState);
+  updateStateFile(stateKey, lastApplied, appliedState);
 
   console.log(`  Written: ${OUTPUT_FILE}`);
   console.log(`  State:   ${STATE_FILE}`);
