@@ -70,7 +70,18 @@ async function main() {
   // ── Step 2: Choose replication level and find sequences ──────────────────────
   console.log("\n── Step 2: Replication state ────────────────────────────────────");
 
-  const ageMins = (Date.now() - new Date(inputTs).getTime()) / 60_000;
+  // overpass.json is rewritten only when a climbing element actually changed, so
+  // its timestamp lags to the last climbing edit worldwide (regularly many hours).
+  // The state file is written on every run, so it - not inputTs - tells how far
+  // behind the replication stream we really are.
+  const savedState: StateFile = existsSync(STATE_FILE)
+      ? JSON.parse(readFileSync(STATE_FILE, "utf-8"))
+      : {};
+  const stateIsCurrent = savedState.timestamp != null
+      && new Date(savedState.timestamp).getTime() >= new Date(inputTs).getTime();
+  const baseTs = stateIsCurrent ? savedState.timestamp as string : inputTs;
+
+  const ageMins = (Date.now() - new Date(baseTs).getTime()) / 60_000;
   let replicationUrl: string;
   let levelName: string;
   let lookback: number;
@@ -83,25 +94,19 @@ async function main() {
 
   const remoteState = parseState(await (await fetchRetry(`${replicationUrl}/state.txt`)).text());
   console.log(`  Remote ${levelName}: seq=${remoteState.sequenceNumber}  ts=${remoteState.timestamp}`);
-  console.log(`  Data age: ${Math.round(ageMins)} min → using ${levelName} replication`);
+  console.log(`  Data age: ${Math.round(ageMins)} min (since ${baseTs}) → using ${levelName} replication`);
 
   // Load or discover local sequence number
   const stateKey = `sequenceNumber_${levelName}` as StateKey;
   let localSeq: number;
 
-  if (existsSync(STATE_FILE)) {
-    const saved = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as StateFile;
-    if (saved[stateKey] != null) {
-      localSeq = saved[stateKey] as number;
-      console.log(`  Local ${levelName}: seq=${localSeq}`);
-    } else {
-      console.log(`  No ${levelName} state found – searching replication archive…`);
-      localSeq = await findSequenceForTimestamp(replicationUrl, inputTs, remoteState.sequenceNumber, lookback);
-      console.log(`  Found starting seq: ${localSeq}`);
-    }
+  const savedSeq = stateIsCurrent ? savedState[stateKey] : undefined;
+  if (savedSeq != null) {
+    localSeq = savedSeq;
+    console.log(`  Local ${levelName}: seq=${localSeq}`);
   } else {
-    console.log(`  No state file – searching ${levelName} replication archive for ${inputTs}…`);
-    localSeq = await findSequenceForTimestamp(replicationUrl, inputTs, remoteState.sequenceNumber, lookback);
+    console.log(`  No ${levelName} state for ${baseTs} – searching replication archive…`);
+    localSeq = await findSequenceForTimestamp(replicationUrl, baseTs, remoteState.sequenceNumber, lookback);
     console.log(`  Found starting seq: ${localSeq}`);
   }
 
