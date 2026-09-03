@@ -7,17 +7,22 @@
  *         'nwr/climbing*' \
  *         nwr/sport=climbing \
  *         nwr/sport=via_ferrata \
+ *         nwr/highway=via_ferrata \
+ *         nwr/route=via_ferrata \
+ *         nwr/via_ferrata_scale \
  *         --overwrite \
  *         --progress \
  *         -o filtered.osm.pbf
  */
 export function isClimbing(tags: Record<string, string>): boolean {
-    if (!tags || Object.keys(tags).length === 0) return false;
+    if (!tags) return false;
     return (
         tags["sport"] === "climbing" ||
         tags["sport"] === "via_ferrata" ||
+        tags["highway"] === "via_ferrata" ||
+        tags["route"] === "via_ferrata" ||
         tags["leisure"] === "climbing" ||
-        "climbing" in tags ||
+        "via_ferrata_scale" in tags ||
         Object.keys(tags).some(k => k.startsWith("climbing"))
     );
 }
