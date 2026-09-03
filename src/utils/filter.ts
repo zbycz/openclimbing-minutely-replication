@@ -21,7 +21,6 @@ export function isClimbing(tags: Record<string, string>): boolean {
         tags["sport"] === "via_ferrata" ||
         tags["highway"] === "via_ferrata" ||
         tags["route"] === "via_ferrata" ||
-        tags["leisure"] === "climbing" ||
         "via_ferrata_scale" in tags ||
         Object.keys(tags).some(k => k.startsWith("climbing"))
     );
